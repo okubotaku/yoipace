@@ -12,6 +12,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  Vibration,
   View,
 } from 'react-native';
 
@@ -94,9 +95,10 @@ export default function App() {
     if (now - lastSipHapticAtRef.current < 1500) return;
     lastSipHapticAtRef.current = now;
 
+    vibrateDevice('sip');
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy)
       .then(() => setHapticStatus(`一口 ${formatClock(new Date())} ${source}`))
-      .catch(() => setHapticStatus(`一口バイブ失敗 ${formatClock(new Date())}`));
+      .catch(() => setHapticStatus(`一口 端末バイブ ${formatClock(new Date())} ${source}`));
   };
 
   const fireWaterHaptic = (source: string) => {
@@ -104,9 +106,10 @@ export default function App() {
     if (now - lastWaterHapticAtRef.current < 1500) return;
     lastWaterHapticAtRef.current = now;
 
+    vibrateDevice('water');
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success)
       .then(() => setHapticStatus(`水 ${formatClock(new Date())} ${source}`))
-      .catch(() => setHapticStatus(`水バイブ失敗 ${formatClock(new Date())}`));
+      .catch(() => setHapticStatus(`水 端末バイブ ${formatClock(new Date())} ${source}`));
   };
 
   useEffect(() => {
@@ -752,6 +755,10 @@ export default function App() {
               <SecondaryButton label="水を飲んだ" onPress={markWaterDone} />
             </View>
             <View style={styles.buttonRow}>
+              <SecondaryButton label="一口バイブテスト" onPress={() => fireSipHaptic('テスト')} />
+              <SecondaryButton label="水バイブテスト" onPress={() => fireWaterHaptic('テスト')} />
+            </View>
+            <View style={styles.buttonRow}>
               {session.status === 'active' ? (
                 <SecondaryButton label="一時停止" onPress={pauseSession} />
               ) : (
@@ -975,6 +982,15 @@ async function scheduleLocalNotification(
 
 async function cancelNotifications(ids: string[]) {
   await Promise.all(ids.map((id) => Notifications.cancelScheduledNotificationAsync(id)));
+}
+
+function vibrateDevice(kind: NotificationKind) {
+  if (Platform.OS === 'ios') {
+    Vibration.vibrate();
+    return;
+  }
+
+  Vibration.vibrate(kind === 'water' ? [0, 140, 120, 420] : [0, 260]);
 }
 
 function getCurrentDrink(session: Pick<DrinkingSession, 'drinks' | 'sipDoneCount'>) {
