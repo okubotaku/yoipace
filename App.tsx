@@ -140,7 +140,7 @@ export default function App() {
   }, [hydrated, history]);
 
   useEffect(() => {
-    const timer = setInterval(() => setNowMs(Date.now()), 30000);
+    const timer = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
 
@@ -163,6 +163,7 @@ export default function App() {
   }, [drinkDraft, profile, selectedMode]);
 
   const currentDrink = session ? getCurrentDrink(session) : null;
+  const sipTimer = session ? getSipTimerState(session, currentDrink, nowMs) : null;
   const activeDurationMinutes = session ? getSessionDurationMinutes(session, nowMs) : 0;
   const adherenceRate = session
     ? getSipAdherenceRate(session.sipDoneCount, session.sipOnPaceCount)
@@ -602,6 +603,31 @@ export default function App() {
             {session.warning ? <Text style={styles.warningText}>{session.warning}</Text> : null}
             {paceCaution ? <Text style={styles.warningText}>{paceCaution}</Text> : null}
 
+            {sipTimer ? (
+              <View style={styles.timerPanel}>
+                <View style={styles.timerHeader}>
+                  <Text style={styles.timerLabel}>次の一口まで</Text>
+                  <Text style={[styles.timerState, sipTimer.isReady && styles.timerStateReady]}>
+                    {sipTimer.statusLabel}
+                  </Text>
+                </View>
+                <Text style={styles.timerValue}>{sipTimer.remainingLabel}</Text>
+                <View style={styles.timerProgressTrack}>
+                  <View
+                    style={[
+                      styles.timerProgressFill,
+                      sipTimer.isReady && styles.timerProgressReady,
+                      { width: `${sipTimer.progressPercent}%` },
+                    ]}
+                  />
+                </View>
+                <View style={styles.timerFooter}>
+                  <Text style={styles.timerHint}>{sipTimer.hint}</Text>
+                  <Text style={styles.timerClock}>{sipTimer.nextClockLabel}</Text>
+                </View>
+              </View>
+            ) : null}
+
             <View style={styles.planBox}>
               <Metric label="当日合計" value={`${session.totalPureAlcoholGrams}g`} />
               <Metric label="飲酒時間" value={`${activeDurationMinutes}分`} />
@@ -863,6 +889,60 @@ function getCurrentDrink(session: Pick<DrinkingSession, 'drinks' | 'sipDoneCount
   return session.drinks.at(-1) ?? null;
 }
 
+function getSipTimerState(
+  session: DrinkingSession,
+  currentDrink: DrinkRecord | null,
+  nowMs: number,
+) {
+  if (!session.nextSipDueAt || session.sipDoneCount >= session.sipReminderCount || !currentDrink) {
+    return {
+      hint: 'この一杯の一口ペースは完了です。',
+      isReady: true,
+      nextClockLabel: '次の一杯を追加するか終了',
+      progressPercent: 100,
+      remainingLabel: '完了',
+      statusLabel: '完了',
+    };
+  }
+
+  if (session.status === 'paused') {
+    return {
+      hint: '再開するまで通知とタイマーは止まっています。',
+      isReady: false,
+      nextClockLabel: `予定 ${formatClock(new Date(session.nextSipDueAt))}`,
+      progressPercent: 0,
+      remainingLabel: '一時停止中',
+      statusLabel: '停止中',
+    };
+  }
+
+  const dueMs = new Date(session.nextSipDueAt).getTime();
+  const remainingSeconds = Math.ceil((dueMs - nowMs) / 1000);
+  const totalSeconds = Math.max(1, Math.round(currentDrink.sipIntervalMinutes * 60));
+  const elapsedSeconds = totalSeconds - Math.max(remainingSeconds, 0);
+  const progressPercent = Math.max(0, Math.min(100, Math.round((elapsedSeconds / totalSeconds) * 100)));
+
+  if (remainingSeconds <= 0) {
+    return {
+      hint: '急がず一口だけ。飲んだら「一口飲んだ」を押してください。',
+      isReady: true,
+      nextClockLabel: `予定 ${formatClock(new Date(session.nextSipDueAt))}`,
+      progressPercent: 100,
+      remainingLabel: '今、一口OK',
+      statusLabel: 'タイミング',
+    };
+  }
+
+  return {
+    hint: '通知まで待つと、今日のペースを守りやすくなります。',
+    isReady: false,
+    nextClockLabel: `予定 ${formatClock(new Date(session.nextSipDueAt))}`,
+    progressPercent,
+    remainingLabel: formatRemainingTime(remainingSeconds),
+    statusLabel: '待つ',
+  };
+}
+
 function getSessionDurationMinutes(session: DrinkingSession, nowMs: number) {
   const endMs = session.endedAt ? new Date(session.endedAt).getTime() : nowMs;
   const activePauseMs =
@@ -885,6 +965,19 @@ function toDateKey(date: Date) {
 
 function formatClock(date: Date) {
   return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+function formatRemainingTime(totalSeconds: number) {
+  const seconds = Math.max(0, totalSeconds);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const restSeconds = seconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(restSeconds).padStart(2, '0')}`;
+  }
+
+  return `${minutes}:${String(restSeconds).padStart(2, '0')}`;
 }
 
 function roundSessionGrams(value: number) {
@@ -1158,6 +1251,74 @@ const styles = StyleSheet.create({
     flexBasis: '30%',
     flexGrow: 1,
     minWidth: 92,
+  },
+  timerClock: {
+    color: '#60726B',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  timerFooter: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 10,
+    justifyContent: 'space-between',
+  },
+  timerHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  timerHint: {
+    color: '#4D5F58',
+    flex: 1,
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  timerLabel: {
+    color: '#33443D',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  timerPanel: {
+    backgroundColor: '#F7FAF8',
+    borderColor: '#C9D6D0',
+    borderRadius: 8,
+    borderWidth: 1,
+    gap: 10,
+    padding: 14,
+  },
+  timerProgressFill: {
+    backgroundColor: '#1F7A68',
+    borderRadius: 999,
+    height: '100%',
+  },
+  timerProgressReady: {
+    backgroundColor: '#D8892A',
+  },
+  timerProgressTrack: {
+    backgroundColor: '#DDE7E2',
+    borderRadius: 999,
+    height: 12,
+    overflow: 'hidden',
+  },
+  timerState: {
+    backgroundColor: '#E6EFEB',
+    borderRadius: 8,
+    color: '#184E45',
+    fontSize: 12,
+    fontWeight: '800',
+    overflow: 'hidden',
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+  },
+  timerStateReady: {
+    backgroundColor: '#FFF1D9',
+    color: '#8A5217',
+  },
+  timerValue: {
+    color: '#13261F',
+    fontSize: 42,
+    fontWeight: '800',
   },
   warningText: {
     backgroundColor: '#FFF0ED',
