@@ -267,16 +267,14 @@ export default function App() {
     return finalStatus === 'granted';
   };
 
-  const scheduleDrinkNotifications = async (drink: DrinkRecord, startDelaySeconds = 0) => {
-    const granted = await ensureNotificationAccess();
-    if (!granted) return [] as string[];
-
+  const scheduleDrinkNotifications = async (drink: DrinkRecord, startsAtMs: number) => {
     const ids: string[] = [];
     for (let i = 1; i <= drink.sips; i += 1) {
-      const id = await scheduleLocalNotification(
+      const firesAtMs = startsAtMs + drink.sipIntervalMinutes * 60000 * i;
+      const id = await scheduleLocalNotificationAt(
         '次の一口のタイミング',
         `${drink.kind}は急がず一口だけ。飲み切り目安は約${drink.recommendedMinutes}分です。`,
-        startDelaySeconds + drink.sipIntervalMinutes * 60 * i,
+        firesAtMs,
         'sip',
       );
       ids.push(id);
@@ -284,10 +282,11 @@ export default function App() {
 
     for (let i = 1; i <= drink.waterReminderCount; i += 1) {
       const spacing = drink.recommendedMinutes / (drink.waterReminderCount + 1);
-      const id = await scheduleLocalNotification(
+      const firesAtMs = startsAtMs + Math.max(60, spacing * 60 * i) * 1000;
+      const id = await scheduleLocalNotificationAt(
         '水を挟むタイミング',
         'ここで水を一口。ペースを落として、飲みすぎを防ぎましょう。',
-        startDelaySeconds + Math.max(60, spacing * 60 * i),
+        firesAtMs,
         'water',
       );
       ids.push(id);
@@ -303,8 +302,13 @@ export default function App() {
     }
 
     const sessionDrink = createSessionDrink(plannedDrink);
-    const notificationIds = await scheduleDrinkNotifications(sessionDrink);
-    const startedAt = new Date().toISOString();
+    const granted = await ensureNotificationAccess();
+    const startedAtMs = Date.now();
+    const notificationIds = granted ? await scheduleDrinkNotifications(sessionDrink, startedAtMs) : [];
+    const startedAt = new Date(startedAtMs).toISOString();
+    const nextSipDueAt = new Date(
+      startedAtMs + sessionDrink.sipIntervalMinutes * 60000,
+    ).toISOString();
     setSession({
       id: `session-${Date.now()}`,
       status: 'active',
@@ -322,7 +326,7 @@ export default function App() {
       notificationIds,
       autoSipIndex: 0,
       nextSipStartedAt: startedAt,
-      nextSipDueAt: addMinutes(Date.now(), sessionDrink.sipIntervalMinutes).toISOString(),
+      nextSipDueAt,
     });
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => undefined);
   };
@@ -342,10 +346,11 @@ export default function App() {
     }
 
     const sessionDrink = createSessionDrink(plannedDrink);
-    const scheduleDelaySeconds = getRemainingAutoSipQueueSeconds(session, Date.now());
-    const notificationIds = await scheduleDrinkNotifications(sessionDrink, scheduleDelaySeconds);
     const autoSipIndex = getAutoSipIndex(session);
     const wasAllSipsDone = autoSipIndex >= session.sipReminderCount || !session.nextSipDueAt;
+    const startsAtMs = wasAllSipsDone ? Date.now() : getAutoSipQueueEndMs(session);
+    const granted = await ensureNotificationAccess();
+    const notificationIds = granted ? await scheduleDrinkNotifications(sessionDrink, startsAtMs) : [];
     setSession({
       ...session,
       drinks: [...session.drinks, sessionDrink],
@@ -354,9 +359,9 @@ export default function App() {
       waterReminderCount: session.waterReminderCount + sessionDrink.waterReminderCount,
       notificationIds: [...session.notificationIds, ...notificationIds],
       autoSipIndex,
-      nextSipStartedAt: wasAllSipsDone ? new Date().toISOString() : session.nextSipStartedAt,
+      nextSipStartedAt: wasAllSipsDone ? new Date(startsAtMs).toISOString() : session.nextSipStartedAt,
       nextSipDueAt: wasAllSipsDone
-        ? addMinutes(Date.now(), sessionDrink.sipIntervalMinutes).toISOString()
+        ? new Date(startsAtMs + sessionDrink.sipIntervalMinutes * 60000).toISOString()
         : session.nextSipDueAt,
     });
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
@@ -422,23 +427,12 @@ export default function App() {
     const autoSipIndex = getAutoSipIndex(session);
     const remainingSips = Math.max(session.sipReminderCount - autoSipIndex, 0);
     const notificationIds: string[] = [];
+    const resumedAtMs = Date.now();
 
     if (current && remainingSips > 0) {
       const granted = await ensureNotificationAccess();
       if (granted) {
-        let delaySeconds = 0;
-        for (let i = autoSipIndex; i < session.sipReminderCount; i += 1) {
-          const drinkForSip = getDrinkForSipIndex(session, i);
-          if (!drinkForSip) break;
-          delaySeconds += drinkForSip.sipIntervalMinutes * 60;
-          const id = await scheduleLocalNotification(
-            '次の一口のタイミング',
-            '再開後もゆっくり一口ずつ進めましょう。',
-            delaySeconds,
-            'sip',
-          );
-          notificationIds.push(id);
-        }
+        notificationIds.push(...(await scheduleRemainingSipNotifications(session, resumedAtMs, autoSipIndex)));
       }
     }
 
@@ -453,10 +447,10 @@ export default function App() {
       pauseStartedAt: undefined,
       notificationIds,
       autoSipIndex,
-      nextSipStartedAt: new Date().toISOString(),
+      nextSipStartedAt: new Date(resumedAtMs).toISOString(),
       nextSipDueAt:
         current && remainingSips > 0
-          ? addMinutes(Date.now(), current.sipIntervalMinutes).toISOString()
+          ? new Date(resumedAtMs + current.sipIntervalMinutes * 60000).toISOString()
           : undefined,
       warning: undefined,
     });
@@ -956,26 +950,27 @@ function parseDrinkDraft(draft: DrinkDraft) {
   };
 }
 
-async function scheduleLocalNotification(
+async function scheduleLocalNotificationAt(
   title: string,
   body: string,
-  seconds: number,
+  firesAtMs: number,
   kind: NotificationKind,
 ) {
   const isWater = kind === 'water';
+  const safeFiresAtMs = Math.max(firesAtMs, Date.now() + 1000);
 
   return Notifications.scheduleNotificationAsync({
     content: {
       title,
       body,
-      data: { kind },
+      data: { firesAtMs: safeFiresAtMs, kind },
       sound: true,
       vibrate: isWater ? [0, 120, 120, 360] : [0, 180],
     },
     trigger: {
-      type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
+      type: Notifications.SchedulableTriggerInputTypes.DATE,
       channelId: isWater ? WATER_CHANNEL_ID : SIP_CHANNEL_ID,
-      seconds: Math.max(1, Math.round(seconds)),
+      date: new Date(safeFiresAtMs),
     },
   });
 }
@@ -1030,9 +1025,34 @@ function getDrinkForSipIndex(session: Pick<DrinkingSession, 'drinks'>, sipIndex:
   return null;
 }
 
-function getRemainingAutoSipQueueSeconds(session: DrinkingSession, nowMs: number) {
+async function scheduleRemainingSipNotifications(
+  session: DrinkingSession,
+  startsAtMs: number,
+  fromSipIndex: number,
+) {
+  const ids: string[] = [];
+  let firesAtMs = startsAtMs;
+
+  for (let i = fromSipIndex; i < session.sipReminderCount; i += 1) {
+    const drinkForSip = getDrinkForSipIndex(session, i);
+    if (!drinkForSip) break;
+
+    firesAtMs += drinkForSip.sipIntervalMinutes * 60000;
+    const id = await scheduleLocalNotificationAt(
+      '次の一口のタイミング',
+      '再開後もゆっくり一口ずつ進めましょう。',
+      firesAtMs,
+      'sip',
+    );
+    ids.push(id);
+  }
+
+  return ids;
+}
+
+function getAutoSipQueueEndMs(session: DrinkingSession) {
   const autoSipIndex = getAutoSipIndex(session);
-  if (!session.nextSipDueAt || autoSipIndex >= session.sipReminderCount) return 0;
+  if (!session.nextSipDueAt || autoSipIndex >= session.sipReminderCount) return Date.now();
 
   let dueMs = new Date(session.nextSipDueAt).getTime();
   for (let index = autoSipIndex + 1; index < session.sipReminderCount; index += 1) {
@@ -1041,7 +1061,7 @@ function getRemainingAutoSipQueueSeconds(session: DrinkingSession, nowMs: number
     dueMs += drink.sipIntervalMinutes * 60000;
   }
 
-  return Math.max(0, Math.ceil((dueMs - nowMs) / 1000));
+  return dueMs;
 }
 
 function advanceAutoSipCountdown(session: DrinkingSession, nowMs: number): DrinkingSession {
@@ -1146,10 +1166,6 @@ function getSessionDurationMinutes(session: DrinkingSession, nowMs: number) {
       : 0;
   const durationMs = endMs - new Date(session.startedAt).getTime() - session.pausedTotalMs - activePauseMs;
   return Math.max(0, Math.round(durationMs / 60000));
-}
-
-function addMinutes(baseMs: number, minutes: number) {
-  return new Date(baseMs + minutes * 60000);
 }
 
 function toDateKey(date: Date) {
