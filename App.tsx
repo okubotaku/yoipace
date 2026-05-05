@@ -18,6 +18,7 @@ import {
 import {
   CONDITIONS,
   DRINK_KIND_SUGGESTIONS,
+  DRINK_PRESETS,
   DRINKING_FREQUENCIES,
   DRINKING_MODES,
   FLUSH_LEVELS,
@@ -490,6 +491,22 @@ export default function App() {
     setHistory((items) => items.map((item) => (item.id === id ? { ...item, nextDayMemo } : item)));
   };
 
+  const selectDrinkKind = (kind: string) => {
+    const preset = DRINK_PRESETS[kind];
+
+    if (!preset) {
+      setDrinkDraft({ ...drinkDraft, kind });
+      return;
+    }
+
+    setDrinkDraft({
+      kind,
+      volumeMl: String(preset.volumeMl),
+      abvPercent: String(preset.abvPercent),
+      sips: String(preset.sips),
+    });
+  };
+
   if (!hydrated) {
     return (
       <View style={styles.loading}>
@@ -596,10 +613,20 @@ export default function App() {
                   {DRINK_KIND_SUGGESTIONS.map((kind) => (
                     <Pressable
                       key={kind}
-                      onPress={() => setDrinkDraft({ ...drinkDraft, kind })}
-                      style={styles.suggestion}
+                      onPress={() => selectDrinkKind(kind)}
+                      style={[
+                        styles.suggestion,
+                        drinkDraft.kind === kind && styles.suggestionSelected,
+                      ]}
                     >
-                      <Text style={styles.suggestionText}>{kind}</Text>
+                      <Text
+                        style={[
+                          styles.suggestionText,
+                          drinkDraft.kind === kind && styles.suggestionTextSelected,
+                        ]}
+                      >
+                        {kind}
+                      </Text>
                     </Pressable>
                   ))}
                 </View>
@@ -1383,10 +1410,16 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 8,
   },
+  suggestionSelected: {
+    backgroundColor: '#184E45',
+  },
   suggestionText: {
     color: '#184E45',
     fontSize: 13,
     fontWeight: '700',
+  },
+  suggestionTextSelected: {
+    color: '#FFFFFF',
   },
   suggestionWrap: {
     flexDirection: 'row',

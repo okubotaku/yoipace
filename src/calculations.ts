@@ -34,6 +34,51 @@ export const DRINK_KIND_SUGGESTIONS = [
   'その他',
 ];
 
+export const DRINK_PRESETS: Record<
+  string,
+  {
+    volumeMl: number;
+    abvPercent: number;
+    sips: number;
+  }
+> = {
+  ビール: {
+    volumeMl: 350,
+    abvPercent: 5,
+    sips: 8,
+  },
+  ハイボール: {
+    volumeMl: 350,
+    abvPercent: 7,
+    sips: 8,
+  },
+  ワイン: {
+    volumeMl: 150,
+    abvPercent: 12,
+    sips: 6,
+  },
+  日本酒: {
+    volumeMl: 180,
+    abvPercent: 15,
+    sips: 6,
+  },
+  焼酎: {
+    volumeMl: 120,
+    abvPercent: 25,
+    sips: 6,
+  },
+  カクテル: {
+    volumeMl: 180,
+    abvPercent: 8,
+    sips: 6,
+  },
+  その他: {
+    volumeMl: 250,
+    abvPercent: 5,
+    sips: 6,
+  },
+};
+
 export const MODE_SETTINGS: Record<
   DrinkingMode,
   {
