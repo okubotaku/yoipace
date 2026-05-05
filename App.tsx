@@ -43,6 +43,8 @@ import type {
 const PROFILE_KEY = 'yoipace.profile.v1';
 const SESSION_KEY = 'yoipace.activeSession.v1';
 const HISTORY_KEY = 'yoipace.history.v1';
+const SIP_CHANNEL_ID = 'yoipace-sip';
+const WATER_CHANNEL_ID = 'yoipace-water';
 
 const emptyDrinkDraft: DrinkDraft = {
   kind: 'ビール',
@@ -147,13 +149,32 @@ export default function App() {
   useEffect(() => {
     const subscription = Notifications.addNotificationReceivedListener((notification) => {
       const kind = notification.request.content.data?.kind as NotificationKind | undefined;
-      if (kind === 'sip' || kind === 'water') {
+      if (kind === 'sip') {
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
+      }
+      if (kind === 'water') {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => undefined);
       }
     });
 
     return () => subscription.remove();
   }, []);
+
+  useEffect(() => {
+    if (!session || session.status !== 'active' || !session.nextSipDueAt) return;
+
+    const dueMs = new Date(session.nextSipDueAt).getTime();
+    if (dueMs > nowMs) return;
+
+    setSession((current) => {
+      if (!current || current.status !== 'active' || !current.nextSipDueAt) return current;
+
+      const currentDueMs = new Date(current.nextSipDueAt).getTime();
+      if (currentDueMs > Date.now()) return current;
+
+      return advanceAutoSipCountdown(current, Date.now());
+    });
+  }, [nowMs, session]);
 
   const plannedDrink = useMemo(() => {
     if (!profile) return null;
@@ -162,7 +183,7 @@ export default function App() {
     return planDrink(parsed, selectedMode, profile);
   }, [drinkDraft, profile, selectedMode]);
 
-  const currentDrink = session ? getCurrentDrink(session) : null;
+  const currentDrink = session ? getAutoCurrentDrink(session) ?? getCurrentDrink(session) : null;
   const sipTimer = session ? getSipTimerState(session, currentDrink, nowMs) : null;
   const activeDurationMinutes = session ? getSessionDurationMinutes(session, nowMs) : 0;
   const adherenceRate = session
@@ -193,10 +214,15 @@ export default function App() {
 
   const ensureNotificationAccess = async () => {
     if (Platform.OS === 'android') {
-      await Notifications.setNotificationChannelAsync('yoipace', {
-        name: 'Yoipace ペース通知',
+      await Notifications.setNotificationChannelAsync(SIP_CHANNEL_ID, {
+        name: 'Yoipace 一口通知',
         importance: Notifications.AndroidImportance.DEFAULT,
-        vibrationPattern: [0, 250, 250, 250],
+        vibrationPattern: [0, 180],
+      });
+      await Notifications.setNotificationChannelAsync(WATER_CHANNEL_ID, {
+        name: 'Yoipace 水分補給通知',
+        importance: Notifications.AndroidImportance.DEFAULT,
+        vibrationPattern: [0, 120, 120, 360],
       });
     }
 
@@ -208,7 +234,7 @@ export default function App() {
     return finalStatus === 'granted';
   };
 
-  const scheduleDrinkNotifications = async (drink: DrinkRecord) => {
+  const scheduleDrinkNotifications = async (drink: DrinkRecord, startDelaySeconds = 0) => {
     const granted = await ensureNotificationAccess();
     if (!granted) return [] as string[];
 
@@ -217,7 +243,7 @@ export default function App() {
       const id = await scheduleLocalNotification(
         '次の一口のタイミング',
         `${drink.kind}は急がず一口だけ。飲み切り目安は約${drink.recommendedMinutes}分です。`,
-        drink.sipIntervalMinutes * 60 * i,
+        startDelaySeconds + drink.sipIntervalMinutes * 60 * i,
         'sip',
       );
       ids.push(id);
@@ -228,7 +254,7 @@ export default function App() {
       const id = await scheduleLocalNotification(
         '水を挟むタイミング',
         'ここで水を一口。ペースを落として、飲みすぎを防ぎましょう。',
-        Math.max(60, spacing * 60 * i),
+        startDelaySeconds + Math.max(60, spacing * 60 * i),
         'water',
       );
       ids.push(id);
@@ -243,7 +269,8 @@ export default function App() {
       return;
     }
 
-    const notificationIds = await scheduleDrinkNotifications(plannedDrink);
+    const sessionDrink = createSessionDrink(plannedDrink);
+    const notificationIds = await scheduleDrinkNotifications(sessionDrink);
     const startedAt = new Date().toISOString();
     setSession({
       id: `session-${Date.now()}`,
@@ -251,16 +278,18 @@ export default function App() {
       mode: selectedMode,
       startedAt,
       pausedTotalMs: 0,
-      drinks: [plannedDrink],
-      totalPureAlcoholGrams: plannedDrink.pureAlcoholGrams,
-      sipReminderCount: plannedDrink.sips,
+      drinks: [sessionDrink],
+      totalPureAlcoholGrams: sessionDrink.pureAlcoholGrams,
+      sipReminderCount: sessionDrink.sips,
       sipDoneCount: 0,
       sipOnPaceCount: 0,
       fastSipCount: 0,
-      waterReminderCount: plannedDrink.waterReminderCount,
+      waterReminderCount: sessionDrink.waterReminderCount,
       waterDoneCount: 0,
       notificationIds,
-      nextSipDueAt: addMinutes(Date.now(), plannedDrink.sipIntervalMinutes).toISOString(),
+      autoSipIndex: 0,
+      nextSipStartedAt: startedAt,
+      nextSipDueAt: addMinutes(Date.now(), sessionDrink.sipIntervalMinutes).toISOString(),
     });
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => undefined);
   };
@@ -279,17 +308,22 @@ export default function App() {
       return;
     }
 
-    const notificationIds = await scheduleDrinkNotifications(plannedDrink);
-    const wasAllSipsDone = session.sipDoneCount >= session.sipReminderCount;
+    const sessionDrink = createSessionDrink(plannedDrink);
+    const scheduleDelaySeconds = getRemainingAutoSipQueueSeconds(session, Date.now());
+    const notificationIds = await scheduleDrinkNotifications(sessionDrink, scheduleDelaySeconds);
+    const autoSipIndex = getAutoSipIndex(session);
+    const wasAllSipsDone = autoSipIndex >= session.sipReminderCount || !session.nextSipDueAt;
     setSession({
       ...session,
-      drinks: [...session.drinks, plannedDrink],
-      totalPureAlcoholGrams: roundSessionGrams(session.totalPureAlcoholGrams + plannedDrink.pureAlcoholGrams),
-      sipReminderCount: session.sipReminderCount + plannedDrink.sips,
-      waterReminderCount: session.waterReminderCount + plannedDrink.waterReminderCount,
+      drinks: [...session.drinks, sessionDrink],
+      totalPureAlcoholGrams: roundSessionGrams(session.totalPureAlcoholGrams + sessionDrink.pureAlcoholGrams),
+      sipReminderCount: session.sipReminderCount + sessionDrink.sips,
+      waterReminderCount: session.waterReminderCount + sessionDrink.waterReminderCount,
       notificationIds: [...session.notificationIds, ...notificationIds],
+      autoSipIndex,
+      nextSipStartedAt: wasAllSipsDone ? new Date().toISOString() : session.nextSipStartedAt,
       nextSipDueAt: wasAllSipsDone
-        ? addMinutes(Date.now(), plannedDrink.sipIntervalMinutes).toISOString()
+        ? addMinutes(Date.now(), sessionDrink.sipIntervalMinutes).toISOString()
         : session.nextSipDueAt,
     });
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
@@ -304,12 +338,10 @@ export default function App() {
 
     const now = Date.now();
     const dueAt = session.nextSipDueAt ? new Date(session.nextSipDueAt).getTime() : now;
-    const tooFast = now < dueAt - 60000;
-    const onPace = !tooFast && now <= dueAt + 10 * 60000;
+    const wasDueInGrace = wasRecentlyDue(session, now);
+    const tooFast = now < dueAt - 60000 && !wasDueInGrace;
+    const onPace = !tooFast;
     const nextSipDoneCount = session.sipDoneCount + 1;
-    const nextSessionBase = { ...session, sipDoneCount: nextSipDoneCount };
-    const nextDrink = getCurrentDrink(nextSessionBase);
-    const remainingSips = session.sipReminderCount - nextSipDoneCount;
     const warning = tooFast
       ? 'ペースが早いです。次の一口は通知まで待って、水を挟みましょう。'
       : undefined;
@@ -319,10 +351,6 @@ export default function App() {
       sipDoneCount: nextSipDoneCount,
       sipOnPaceCount: session.sipOnPaceCount + (onPace ? 1 : 0),
       fastSipCount: session.fastSipCount + (tooFast ? 1 : 0),
-      nextSipDueAt:
-        remainingSips > 0 && nextDrink
-          ? addMinutes(now, nextDrink.sipIntervalMinutes).toISOString()
-          : undefined,
       warning,
     });
 
@@ -357,18 +385,23 @@ export default function App() {
 
   const resumeSession = async () => {
     if (!session || session.status !== 'paused') return;
-    const current = getCurrentDrink(session);
-    const remainingSips = Math.max(session.sipReminderCount - session.sipDoneCount, 0);
+    const current = getAutoCurrentDrink(session);
+    const autoSipIndex = getAutoSipIndex(session);
+    const remainingSips = Math.max(session.sipReminderCount - autoSipIndex, 0);
     const notificationIds: string[] = [];
 
     if (current && remainingSips > 0) {
       const granted = await ensureNotificationAccess();
       if (granted) {
-        for (let i = 1; i <= remainingSips; i += 1) {
+        let delaySeconds = 0;
+        for (let i = autoSipIndex; i < session.sipReminderCount; i += 1) {
+          const drinkForSip = getDrinkForSipIndex(session, i);
+          if (!drinkForSip) break;
+          delaySeconds += drinkForSip.sipIntervalMinutes * 60;
           const id = await scheduleLocalNotification(
             '次の一口のタイミング',
             '再開後もゆっくり一口ずつ進めましょう。',
-            current.sipIntervalMinutes * 60 * i,
+            delaySeconds,
             'sip',
           );
           notificationIds.push(id);
@@ -386,6 +419,8 @@ export default function App() {
       pausedTotalMs: session.pausedTotalMs + pausedForMs,
       pauseStartedAt: undefined,
       notificationIds,
+      autoSipIndex,
+      nextSipStartedAt: new Date().toISOString(),
       nextSipDueAt:
         current && remainingSips > 0
           ? addMinutes(Date.now(), current.sipIntervalMinutes).toISOString()
@@ -653,7 +688,7 @@ export default function App() {
 
             <View style={styles.buttonRow}>
               <PrimaryButton
-                label="一口飲んだ"
+                label="一口を記録"
                 onPress={markSipDone}
                 disabled={session.status !== 'active'}
               />
@@ -863,14 +898,19 @@ async function scheduleLocalNotification(
   seconds: number,
   kind: NotificationKind,
 ) {
+  const isWater = kind === 'water';
+
   return Notifications.scheduleNotificationAsync({
     content: {
       title,
       body,
       data: { kind },
+      sound: true,
+      vibrate: isWater ? [0, 120, 120, 360] : [0, 180],
     },
     trigger: {
       type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
+      channelId: isWater ? WATER_CHANNEL_ID : SIP_CHANNEL_ID,
       seconds: Math.max(1, Math.round(seconds)),
     },
   });
@@ -889,12 +929,94 @@ function getCurrentDrink(session: Pick<DrinkingSession, 'drinks' | 'sipDoneCount
   return session.drinks.at(-1) ?? null;
 }
 
+function createSessionDrink(drink: DrinkRecord): DrinkRecord {
+  return {
+    ...drink,
+    id: `drink-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    addedAt: new Date().toISOString(),
+  };
+}
+
+function getAutoSipIndex(session: DrinkingSession) {
+  return Math.min(session.autoSipIndex ?? 0, session.sipReminderCount);
+}
+
+function getAutoCurrentDrink(session: DrinkingSession) {
+  return getDrinkForSipIndex(session, getAutoSipIndex(session));
+}
+
+function getDrinkForSipIndex(session: Pick<DrinkingSession, 'drinks'>, sipIndex: number) {
+  if (sipIndex < 0) return null;
+
+  let passed = sipIndex;
+  for (const drink of session.drinks) {
+    if (passed < drink.sips) return drink;
+    passed -= drink.sips;
+  }
+
+  return null;
+}
+
+function getRemainingAutoSipQueueSeconds(session: DrinkingSession, nowMs: number) {
+  const autoSipIndex = getAutoSipIndex(session);
+  if (!session.nextSipDueAt || autoSipIndex >= session.sipReminderCount) return 0;
+
+  let dueMs = new Date(session.nextSipDueAt).getTime();
+  for (let index = autoSipIndex + 1; index < session.sipReminderCount; index += 1) {
+    const drink = getDrinkForSipIndex(session, index);
+    if (!drink) break;
+    dueMs += drink.sipIntervalMinutes * 60000;
+  }
+
+  return Math.max(0, Math.ceil((dueMs - nowMs) / 1000));
+}
+
+function advanceAutoSipCountdown(session: DrinkingSession, nowMs: number): DrinkingSession {
+  if (!session.nextSipDueAt) return session;
+
+  let previousDueMs = new Date(session.nextSipDueAt).getTime();
+  let nextDueMs = previousDueMs;
+  let nextSipIndex = getAutoSipIndex(session) + 1;
+
+  while (nextSipIndex < session.sipReminderCount) {
+    const drink = getDrinkForSipIndex(session, nextSipIndex);
+    if (!drink) break;
+
+    nextDueMs += drink.sipIntervalMinutes * 60000;
+    if (nextDueMs > nowMs) {
+      return {
+        ...session,
+        autoSipIndex: nextSipIndex,
+        nextSipStartedAt: new Date(previousDueMs).toISOString(),
+        nextSipDueAt: new Date(nextDueMs).toISOString(),
+      };
+    }
+
+    previousDueMs = nextDueMs;
+    nextSipIndex += 1;
+  }
+
+  return {
+    ...session,
+    autoSipIndex: session.sipReminderCount,
+    nextSipStartedAt: new Date(previousDueMs).toISOString(),
+    nextSipDueAt: undefined,
+  };
+}
+
+function wasRecentlyDue(session: DrinkingSession, nowMs: number) {
+  if (!session.nextSipStartedAt) return false;
+
+  const previousDueMs = new Date(session.nextSipStartedAt).getTime();
+  return nowMs >= previousDueMs && nowMs - previousDueMs <= 10 * 60000;
+}
+
 function getSipTimerState(
   session: DrinkingSession,
   currentDrink: DrinkRecord | null,
   nowMs: number,
 ) {
-  if (!session.nextSipDueAt || session.sipDoneCount >= session.sipReminderCount || !currentDrink) {
+  if (!session.nextSipDueAt || getAutoSipIndex(session) >= session.sipReminderCount || !currentDrink) {
     return {
       hint: 'この一杯の一口ペースは完了です。',
       isReady: true,
@@ -924,7 +1046,7 @@ function getSipTimerState(
 
   if (remainingSeconds <= 0) {
     return {
-      hint: '急がず一口だけ。飲んだら「一口飲んだ」を押してください。',
+      hint: '急がず一口だけ。記録したい時だけ「一口を記録」を押してください。',
       isReady: true,
       nextClockLabel: `予定 ${formatClock(new Date(session.nextSipDueAt))}`,
       progressPercent: 100,

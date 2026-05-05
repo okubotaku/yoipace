@@ -67,6 +67,8 @@ export type DrinkingSession = {
   waterReminderCount: number;
   waterDoneCount: number;
   notificationIds: string[];
+  autoSipIndex?: number;
+  nextSipStartedAt?: string;
   nextSipDueAt?: string;
   warning?: string;
 };
