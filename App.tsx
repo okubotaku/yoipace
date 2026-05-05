@@ -2,7 +2,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Haptics from 'expo-haptics';
 import * as Notifications from 'expo-notifications';
 import { StatusBar } from 'expo-status-bar';
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   KeyboardAvoidingView,
@@ -82,7 +82,31 @@ export default function App() {
   const [session, setSession] = useState<DrinkingSession | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [notificationStatus, setNotificationStatus] = useState('未確認');
+  const [hapticStatus, setHapticStatus] = useState('未発火');
   const [nowMs, setNowMs] = useState(Date.now());
+  const lastSipHapticAtRef = useRef(0);
+  const lastWaterHapticAtRef = useRef(0);
+  const lastSipHapticDueRef = useRef<string | null>(null);
+
+  const fireSipHaptic = (source: string) => {
+    const now = Date.now();
+    if (now - lastSipHapticAtRef.current < 1500) return;
+    lastSipHapticAtRef.current = now;
+
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy)
+      .then(() => setHapticStatus(`一口 ${formatClock(new Date())} ${source}`))
+      .catch(() => setHapticStatus(`一口バイブ失敗 ${formatClock(new Date())}`));
+  };
+
+  const fireWaterHaptic = (source: string) => {
+    const now = Date.now();
+    if (now - lastWaterHapticAtRef.current < 1500) return;
+    lastWaterHapticAtRef.current = now;
+
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success)
+      .then(() => setHapticStatus(`水 ${formatClock(new Date())} ${source}`))
+      .catch(() => setHapticStatus(`水バイブ失敗 ${formatClock(new Date())}`));
+  };
 
   useEffect(() => {
     const load = async () => {
@@ -150,10 +174,10 @@ export default function App() {
     const subscription = Notifications.addNotificationReceivedListener((notification) => {
       const kind = notification.request.content.data?.kind as NotificationKind | undefined;
       if (kind === 'sip') {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
+        fireSipHaptic('通知');
       }
       if (kind === 'water') {
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => undefined);
+        fireWaterHaptic('通知');
       }
     });
 
@@ -165,6 +189,11 @@ export default function App() {
 
     const dueMs = new Date(session.nextSipDueAt).getTime();
     if (dueMs > nowMs) return;
+
+    if (lastSipHapticDueRef.current !== session.nextSipDueAt) {
+      lastSipHapticDueRef.current = session.nextSipDueAt;
+      fireSipHaptic('タイマー');
+    }
 
     setSession((current) => {
       if (!current || current.status !== 'active' || !current.nextSipDueAt) return current;
@@ -684,6 +713,7 @@ export default function App() {
                 </Text>
               ) : null}
               <Text style={styles.detailText}>通知: {notificationStatus}</Text>
+              <Text style={styles.detailText}>バイブ: {hapticStatus}</Text>
             </View>
 
             <View style={styles.buttonRow}>
